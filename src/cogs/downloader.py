@@ -42,6 +42,13 @@ def get_message_file(message: Message):
     return telegram_file, file_name
 
 
+def resolve_file_path(file_path: str) -> str:
+    """Resolve relative Bot API paths while preserving local-mode absolute paths."""
+    if os.path.isabs(file_path):
+        return file_path
+    return os.path.join(BOT_API_DIR, TOKEN_SUB_DIR, file_path.lstrip("/\\\\"))
+
+
 @command_handler("status")
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send downloading files status to the user."""
@@ -145,7 +152,7 @@ async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -
         download_file.download_complete()
 
     file_path = new_file.file_path
-    current_file_path = f"{BOT_API_DIR}{TOKEN_SUB_DIR}/{file_path}"
+    current_file_path = resolve_file_path(file_path)
     move_to_path = f"{DOWNLOAD_TO_DIR}{file_name}"
 
     try:
