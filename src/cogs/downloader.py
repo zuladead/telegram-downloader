@@ -8,6 +8,7 @@ import traceback
 
 from telegram import Message, Update
 from telegram.ext import ContextTypes, filters
+from telegram.helpers import escape_markdown
 
 from ..middlewares.auth import auth_required
 from ..middlewares.handlers import (
@@ -17,6 +18,7 @@ from ..middlewares.handlers import (
 )
 from ..models import DownloadFile, downloading_files
 from ..utils import check_file_exists, env, get_file
+from ..utils.file_naming import build_download_name
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +61,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_message = "*Downloading files status:*\nPage 1\n"
 
     for i, file in enumerate(downloading_files.values(), start=1):
+        display_name = escape_markdown(file.file_name, version=2, entity_type="code")
         file_status = (
-            f"> 📄 *File name:*   `{file.file_name}`\n"
+            f"> 📄 *File name:*   `{display_name}`\n"
             f"> 💾 *File size:*   `{file.file_size_mb}`\n"
             f"> ⏰ *Start time:*   `{file.start_datetime}`\n"
             f"> ⏱ *Duration:*   `{file.current_download_duration}`\n"
@@ -114,6 +117,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run the existing Yes branch for a document, video, or audio message."""
     telegram_file, file_name = get_message_file(message)
+    file_name = build_download_name(message, telegram_file, file_name)
+    display_name = escape_markdown(file_name, version=2, entity_type="code")
     file_id = telegram_file.file_id
     file_size = telegram_file.file_size or 0
 
@@ -141,7 +146,7 @@ async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(
             (
                 f"⛔ Error downloading file\n"
-                f"> 📄 *File name:*   `{download_file.file_name}`\n"
+                f"> 📄 *File name:*   `{display_name}`\n"
                 f"> 💾 *File size:*   `{download_file.file_size_mb}`\n"
                 f"```\n{e}```"
             ),
@@ -153,7 +158,8 @@ async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -
 
     file_path = new_file.file_path
     current_file_path = resolve_file_path(file_path)
-    move_to_path = f"{DOWNLOAD_TO_DIR}{file_name}"
+    move_to_path = os.path.join(DOWNLOAD_TO_DIR, file_name)
+    display_path = escape_markdown(move_to_path, version=2, entity_type="code")
 
     try:
         os.makedirs(DOWNLOAD_TO_DIR, exist_ok=True)
@@ -169,7 +175,7 @@ async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -
                 (
                     f"⛔ Error moving file\n"
                     f"> 📂 *File path:*   `{file_path}`\n"
-                    f"> 📂 *Move to path:*   `{move_to_path}`\n"
+                    f"> 📂 *Move to path:*   `{display_path}`\n"
                     f"Rename error:\n```\n{rename_error}```\n"
                     f"Move error:\n```\n{move_error}```"
                 ),
@@ -185,7 +191,7 @@ async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -
 
     response_message = (
         f"✅ File downloaded successfully\\.\n\n"
-        f"> 📄 *File name:*   `{download_file.file_name}`\n"
+        f"> 📄 *File name:*   `{display_name}`\n"
         f"> 📂 *File path:*   `{file_path}`\n"
         f"> 💾 *File size:*   `{download_file.file_size_mb}`\n"
         f"> 🔻 *Retries:*   `{download_file.download_retries}`\n"

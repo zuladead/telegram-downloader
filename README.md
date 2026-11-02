@@ -11,7 +11,7 @@
 
 This project is a Telegram bot designed for personal use, leveraging the [local Telegram Bot API server](https://github.com/tdlib/telegram-bot-api) to download large video files sent or forwarded to the bot, directly to a specified local directory.
 
-It's a simple solution that doesn't require a desktop or graphical client, and maintains the original file name. It's particularly useful for forwarding large video files 🎬 to download onto a NAS system.
+It's a simple solution that doesn't require a desktop or graphical client, and keeps the original file name as part of a descriptive output name. It's particularly useful for forwarding large video files 🎬 to download onto a NAS system.
 
 ## Telethon Version<a name = "telethon_version"></a>
 
@@ -98,3 +98,55 @@ To use the bot, simply direct message it or add it to a group, depending on what
 You can use the `/help` command to learn more about how to use the bot.
 
 To download a video file, simply send/forward it to the bot. The bot will then ask you to confirm the download with a 'Yes' or 'No' button. Once you confirm, the bot will download the video file and notify you once the download is complete.
+
+## Download filenames
+
+Documents, videos, and audio files are saved as:
+
+```text
+original-stem_source_YYYY-MM-DD_caption_file_unique_id.extension
+```
+
+- The original extension and the complete Telegram `file_unique_id` are preserved.
+- Source uses the forwarded channel/chat/user name when available, including
+  hidden-sender display names. Missing sources use `来源未知`.
+- The date uses the original forward date, or the received message date for
+  direct uploads, converted to Beijing time (UTC+8).
+- Caption uses the media message's own caption. Missing captions use `无说明`.
+  Separate text messages and captions on other album items are not combined.
+- Invalid filename characters, control characters, and line breaks are cleaned.
+  Names are limited to 240 UTF-8 bytes: caption, original stem, then source are
+  shortened as needed. The full unique ID and extension are never shortened.
+- Files without an original name keep the existing generated-name fallback.
+
+Different Telegram files with identical original names can now be saved
+separately. Existing files are not renamed. This stage does not add SQLite,
+persistent unique-ID deduplication, or video-content matching. Forwarding the
+same file with different source/caption/date metadata can still create another
+filename until persistent deduplication is added.
+
+### Local verification
+
+Install the project dependencies, then run tests with dummy configuration:
+
+```bash
+BOT_TOKEN=123:test LOCAL_BOT_API_URL=http://localhost:8081 \
+BOT_API_DIR=/tmp/bot-api/ DOWNLOAD_TO_DIR=/tmp/downloads/ \
+USER_ID=1 CHAT_ID=1 python -m unittest discover -s tests -v
+```
+
+### Publish and deploy this stage
+
+The Docker workflow runs manually. After updating `main`, open GitHub Actions,
+select **Build and Push Docker Image**, and run it against `main`. Wait for it
+to publish `ghcr.io/zuladead/telegram-downloader:main`, then on the NAS run:
+
+```bash
+docker compose -f docker-compose.prod.yml pull bot
+docker compose -f docker-compose.prod.yml up -d --no-deps bot
+docker compose -f docker-compose.prod.yml logs --tail=100 bot
+```
+
+Verify two different files sharing the same original name, a channel forward
+with a caption, and a direct upload without a caption. Keep the existing
+download and Bot API volume mappings.

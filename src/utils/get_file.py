@@ -70,7 +70,7 @@ def check_file_exists(
     Raises:
         Exception: If the file already exists in the download directory or is being downloaded.
     """
-    if os.path.exists(DOWNLOAD_TO_DIR + file_name):
+    if os.path.exists(os.path.join(DOWNLOAD_TO_DIR, file_name)):
         raise Exception("File already exists in downloads folder.")
 
     if check_downloading_files:
