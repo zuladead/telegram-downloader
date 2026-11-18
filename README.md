@@ -99,7 +99,66 @@ You can use the `/help` command to learn more about how to use the bot.
 
 To download a video file, simply send/forward it to the bot. The bot will then ask you to confirm the download with a 'Yes' or 'No' button. Once you confirm, the bot will download the video file and notify you once the download is complete.
 
-## Download filenames
+## Persistent queue, notifications, and retry
+
+Media messages are now accepted into a persistent FIFO queue. Two workers run
+by default; forwarding 50 or more files does not create 50 simultaneous Python
+download jobs. `QUEUE_CAPACITY` limits all accepted unfinished jobs (default
+1000). A rejected file receives a batched notice and must be sent again.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `DOWNLOAD_CONCURRENCY` | `2` | Workers, including download and final file copy (1–10) |
+| `QUEUE_CAPACITY` | `1000` | Maximum accepted queued + running jobs |
+| `DOWNLOAD_TASK_TIMEOUT` | `3600` | Seconds for all getFile attempts of one run |
+| `NOTIFY_BATCH_SECONDS` | `5` | Collect events before sending a summary |
+| `NOTIFY_MIN_INTERVAL` | `3.1` | Minimum interval between summary messages |
+| `TASK_DB_PATH` | `./downloads/.telegram-downloader/tasks.sqlite3` | Persistent task history |
+
+The production Compose file stores SQLite under the existing download volume;
+keep that directory across upgrades. No additional database container or Python
+dependency is needed. Completed history is retained, but this is not persistent
+unique-ID/content deduplication. Duplicate active files are rejected; an existing
+destination with the expected size is treated as an already published file.
+
+- `/status`: counts and the five most recent failed task IDs/reasons.
+- `/retry_failed`: requeue saved failures up to the available queue capacity.
+- `/retry TASK_ID`: requeue one saved failed job. Repeating the command does not
+  duplicate an active task.
+- Restart: queued/interrupted jobs recover automatically; failed jobs wait for
+  an explicit retry. Reducing queue capacity never discards an existing backlog.
+
+Each job has a stable `task=...` ID in queue, attempt, download, moving, and final
+success/failure logs. Filenames retain the format described below. File copies
+use a temporary file and publish only after size verification; the destination
+filesystem must support hard links (normal local Linux NAS filesystems do).
+Bot tokens in logged exceptions/paths are redacted.
+
+Download notifications use plain text, are combined into bounded messages, and
+respect Telegram `RetryAfter` cooldowns. Notification transport errors do not
+change task success or prevent downloading. The notification buffer keeps the
+latest 500 events per chat; during a prolonged outage some old notices can be
+omitted. SQLite and `/status` remain the authoritative task results. Pending
+notifications themselves are not persisted across restart.
+
+Local Bot API performs the underlying transfer. An HTTP timeout/cancellation
+ends Python's wait and does not guarantee cancellation of that server-side
+transfer. The worker limit bounds Python jobs, not orphaned transfers inside
+Local Bot API. Five network attempts are followed by a saved failure, with a
+separate total waiting deadline. Long-running final file copies retain their
+worker slot and finish safely during graceful shutdown.
+
+Old-version failures cannot be recovered from logs alone: the old application
+did not persist the Telegram `file_id` needed for a retry (`file_unique_id` is
+not a downloadable ID). Forward those files again once after upgrading; later
+failures can be retried without forwarding again.
+
+After deploying, verify with a batch of 60 small files, `/status`, and a failed
+job followed by `/retry TASK_ID`. Confirm at most two `state=running` jobs,
+batched notices, stable IDs across retries, and `state=succeeded` after final
+publication. Keep both existing volume mappings.
+
+## Filename format
 
 Documents, videos, and audio files are saved as:
 
@@ -120,8 +179,8 @@ original-stem_source_YYYY-MM-DD_caption_file_unique_id.extension
 - Files without an original name keep the existing generated-name fallback.
 
 Different Telegram files with identical original names can now be saved
-separately. Existing files are not renamed. This stage does not add SQLite,
-persistent unique-ID deduplication, or video-content matching. Forwarding the
+separately. Existing files are not renamed. The task database does not add
+persistent unique-ID deduplication or video-content matching. Forwarding the
 same file with different source/caption/date metadata can still create another
 filename until persistent deduplication is added.
 

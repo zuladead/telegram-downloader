@@ -18,7 +18,9 @@ commands = {
     "/help": "Get help",
     "/info": "Get user and chat info",
     "/storage": "Get available storage information",
-    "/status": "Get downloading files status",
+    "/status": "Get queue counts and recent failed task IDs",
+    "/retry_failed": "Requeue saved failed downloads",
+    "/retry TASK_ID": "Retry one failed download",
 }
 
 
