@@ -1,0 +1,34 @@
+version: "3.7"
+
+services:
+    telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        environment:
+            TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+            TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+            TELEGRAM_LOCAL: "${TELEGRAM_LOCAL}"
+        volumes:
+            - ${BOT_API_DIR}:/var/lib/telegram-bot-api
+        restart: unless-stopped
+
+    bot:
+        image: ghcr.io/zuladead/telegram-downloader:main
+        environment:
+            LOCAL_BOT_API_URL: "http://telegram-bot-api:8081"
+            BOT_API_DIR: "/var/lib/telegram-bot-api/"
+            DOWNLOAD_TO_DIR: "./downloads/"
+            BOT_TOKEN: "${BOT_TOKEN}"
+            USER_ID: "${USER_ID}"
+            CHAT_ID: "${CHAT_ID}"
+            DOWNLOAD_CONCURRENCY: "${DOWNLOAD_CONCURRENCY:-2}"
+            QUEUE_CAPACITY: "${QUEUE_CAPACITY:-1000}"
+            TASK_DB_PATH: "/app/downloads/.telegram-downloader/tasks.sqlite3"
+            DOWNLOAD_TASK_TIMEOUT: "${DOWNLOAD_TASK_TIMEOUT:-3600}"
+            NOTIFY_BATCH_SECONDS: "${NOTIFY_BATCH_SECONDS:-5}"
+            NOTIFY_MIN_INTERVAL: "${NOTIFY_MIN_INTERVAL:-3.1}"
+        volumes:
+            - ${DOWNLOAD_TO_DIR}:/app/downloads
+            - ${BOT_API_DIR}:/var/lib/telegram-bot-api
+        depends_on:
+            - telegram-bot-api
+        restart: unless-stopped
