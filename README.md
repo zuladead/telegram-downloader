@@ -194,6 +194,31 @@ BOT_API_DIR=/tmp/bot-api/ DOWNLOAD_TO_DIR=/tmp/downloads/ \
 USER_ID=1 CHAT_ID=1 python -m unittest discover -s tests -v
 ```
 
+### fnOS Docker projects
+
+`docker-compose.yml` is a standalone copy of `docker-compose.prod.yml` for
+Docker project managers that look for the default filename. It uses the same
+images, settings and volume mappings; keep both files synchronized when changing
+production configuration. No `include`, `extends`, or symbolic links are needed.
+
+Place `docker-compose.yml` and your configured `.env` in the same project
+directory. In fnOS, use that directory for the Docker project, or paste the YAML
+into its Compose editor and supply the environment values there. Keep the
+existing `BOT_API_DIR` and `DOWNLOAD_TO_DIR` host paths when updating an existing
+installation, and update that existing project rather than running a second
+instance with the same bot token. The task database stays in the download volume.
+
+From a shell in that directory, the default filename also permits:
+
+```bash
+docker compose pull bot
+docker compose up -d --no-deps bot
+docker compose logs --tail=100 bot
+```
+
+The YAML references the published `:main` image. New queue features require the
+PR to be merged and the Docker image to be built before pulling on the NAS.
+
 ### Publish and deploy this stage
 
 The Docker workflow runs manually. After updating `main`, open GitHub Actions,
