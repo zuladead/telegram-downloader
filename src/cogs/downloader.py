@@ -1,88 +1,147 @@
 import asyncio
+import json
 import logging
-import math
 import os
-import platform
 import shutil
-import traceback
+from pathlib import Path
 
 from telegram import Message, Update
 from telegram.ext import ContextTypes, filters
-from telegram.helpers import escape_markdown
 
 from ..middlewares.auth import auth_required
-from ..middlewares.handlers import (
-    callback_query_handler,
-    command_handler,
-    message_handler,
-)
-from ..models import DownloadFile, downloading_files
-from ..utils import check_file_exists, env, get_file
+from ..middlewares.handlers import callback_query_handler, command_handler, message_handler
+from ..models import DownloadFile
+from ..utils import env, get_file
 from ..utils.file_naming import build_download_name
 
 logger = logging.getLogger(__name__)
-
-BOT_TOKEN = env.BOT_TOKEN
 BOT_API_DIR = env.BOT_API_DIR
 DOWNLOAD_TO_DIR = env.DOWNLOAD_TO_DIR
-
-TOKEN_SUB_DIR = BOT_TOKEN.replace(":", "") if os.name == "nt" else BOT_TOKEN
+TOKEN_SUB_DIR = env.BOT_TOKEN.replace(':', '') if os.name == 'nt' else env.BOT_TOKEN
 
 
 def get_message_file(message: Message):
-    """Return a supported Telegram file and a usable original file name."""
-    telegram_file = message.document or message.video or message.audio
-    if telegram_file is None:
-        raise ValueError("Message does not contain a supported file")
-
-    file_name = telegram_file.file_name
-    if not file_name:
-        media_type = "video" if message.video else "audio"
-        extension = ".mp4" if message.video else ".mp3"
-        file_name = f"{media_type}_{telegram_file.file_unique_id}{extension}"
-
-    return telegram_file, file_name
+    media = message.document or message.video or message.audio
+    if media is None:
+        raise ValueError('Message does not contain a supported file')
+    name = media.file_name
+    if not name:
+        kind, extension = ('video', '.mp4') if message.video else ('audio', '.mp3')
+        name = f'{kind}_{media.file_unique_id}{extension}'
+    return media, name
 
 
-def resolve_file_path(file_path: str) -> str:
-    """Resolve relative Bot API paths while preserving local-mode absolute paths."""
+def resolve_file_path(file_path):
     if os.path.isabs(file_path):
         return file_path
-    return os.path.join(BOT_API_DIR, TOKEN_SUB_DIR, file_path.lstrip("/\\\\"))
+    return os.path.join(BOT_API_DIR, TOKEN_SUB_DIR, file_path.lstrip('/\\'))
 
 
-@command_handler("status")
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send downloading files status to the user."""
-    if not downloading_files:
-        await update.message.reply_text("No files are being downloaded at the moment.")
+def _publish(source, target, expected_size, task_id):
+    """Copy to a task-specific partial file; only publish verified complete bytes."""
+    partial = target.with_name(f'.{task_id}.part')
+    try:
+        shutil.copyfile(source, partial)
+        size = partial.stat().st_size
+        if expected_size and size != expected_size:
+            raise ValueError(f'File size mismatch: expected {expected_size}, got {size}')
+        # Never overwrite a file created while this task was downloading.
+        # Hard-link publication is atomic and fails if the target exists.
+        os.link(partial, target)
+        partial.unlink()
+        source.unlink()
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+async def run_download(bot, task_id, payload):
+    target = Path(DOWNLOAD_TO_DIR) / payload['file_name']
+    if target.exists():
+        # A process may have stopped after publication but before saving success.
+        if payload['file_size'] and target.stat().st_size == payload['file_size']:
+            logger.info('task=%s state=verified_existing result=%s', task_id, target)
+            return str(target)
+        raise FileExistsError('Destination exists with unknown or mismatched size')
+    file = DownloadFile(payload['file_id'], payload['file_name'], payload['file_size'])
+    file.task_id = task_id
+    # Bound all getFile attempts together; local Bot API may still transfer in
+    # the background after the HTTP request has ended.
+    async with asyncio.timeout(env.DOWNLOAD_TASK_TIMEOUT):
+        downloaded = await get_file(bot, file)
+    if not downloaded.file_path:
+        raise ValueError('Bot API returned no local file path')
+    source = Path(resolve_file_path(downloaded.file_path))
+    size = source.stat().st_size
+    if payload['file_size'] and size != payload['file_size']:
+        raise ValueError(f'File size mismatch: expected {payload["file_size"]}, got {size}')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    logger.info('task=%s state=moving bytes=%s', task_id, size)
+    # A copying thread cannot be cancelled. Keep its slot until it finishes so
+    # restart/cancellation cannot race another writer or lose its final state.
+    move = asyncio.create_task(asyncio.to_thread(
+        _publish, source, target, payload['file_size'], task_id
+    ))
+    try:
+        await asyncio.shield(move)
+    except asyncio.CancelledError:
+        await move
+        raise
+    if os.name != 'nt':
+        os.chmod(target, 0o664)
+    return str(target)
+
+
+async def start_download(message, context):
+    media, name = get_message_file(message)
+    payload = {
+        'file_id': media.file_id,
+        'file_unique_id': media.file_unique_id,
+        'file_name': build_download_name(message, media, name),
+        'file_size': media.file_size or 0,
+        'chat_id': message.chat_id,
+        'message_id': message.message_id,
+    }
+    manager = context.application.bot_data['downloads']
+    notices = context.application.bot_data['notifications']
+    try:
+        task_id, created = manager.submit(payload)
+    except ValueError as exc:
+        logger.warning('state=rejected message=%s error=%s', message.message_id, exc)
+        notices.add(message.chat_id, f'未入队 message={message.message_id}: {exc}')
         return
+    verb = '已排队' if created else '已在队列中'
+    notices.add(message.chat_id, f'{verb} #{task_id}: {payload["file_name"]}')
 
-    status_message = "*Downloading files status:*\nPage 1\n"
 
-    for i, file in enumerate(downloading_files.values(), start=1):
-        display_name = escape_markdown(file.file_name, version=2, entity_type="code")
-        file_status = (
-            f"> 📄 *File name:*   `{display_name}`\n"
-            f"> 💾 *File size:*   `{file.file_size_mb}`\n"
-            f"> ⏰ *Start time:*   `{file.start_datetime}`\n"
-            f"> ⏱ *Duration:*   `{file.current_download_duration}`\n"
-            f"> 🔻 *Retries:*   `{file.download_retries}`\n"
-            f"> 🔄 *Status:*   `{file.status}`\n\n"
-        )
-        status_message += file_status
+@command_handler('status')
+@auth_required
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    manager = context.application.bot_data['downloads']
+    counts = manager.summary()
+    text = f'并发上限: {manager.concurrency}\n' + '\n'.join(
+        f'{label}: {counts.get(state, 0)}' for state, label in [
+            ('queued', '等待'), ('running', '下载/移动中'),
+            ('succeeded', '成功'), ('failed', '失败')
+        ]
+    )
+    for task_id, state, encoded, error, runs in manager.recent(state='failed', limit=5):
+        name = json.loads(encoded)['file_name'][:40]
+        text += f'\n#{task_id} {name}\n{state} 执行{runs}次 {error[:60]}'
+    text += '\n/retry_failed 重试失败任务；/retry 任务编号 重试单个任务'
+    context.application.bot_data['notifications'].add(update.effective_chat.id, text)
 
-        if i % 2 == 0 or i == len(downloading_files):
-            if i > 2:
-                status_message = f"Page {math.ceil(i / 2)}\n" + status_message
 
-            await context.bot.send_message(
-                chat_id=update.message.chat_id,
-                text=status_message,
-                parse_mode="MarkdownV2",
-            )
-            status_message = ""
-            await asyncio.sleep(0.3)
+@command_handler(['retry_failed', 'retry'])
+@auth_required
+async def retry_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    manager = context.application.bot_data['downloads']
+    notices = context.application.bot_data['notifications']
+    command = update.effective_message.text.split()[0].split('@')[0]
+    if command == '/retry' and len(context.args) != 1:
+        notices.add(update.effective_chat.id, '用法: /retry 任务编号')
+        return
+    count = manager.retry_failed(context.args[0] if command == '/retry' else None)
+    notices.add(update.effective_chat.id, f'已将 {count} 个失败任务重新排队。队列满时剩余任务保留失败状态。')
 
 
 SUPPORTED_FILES = filters.Document.ALL | filters.VIDEO | filters.AUDIO
@@ -90,113 +149,19 @@ SUPPORTED_FILES = filters.Document.ALL | filters.VIDEO | filters.AUDIO
 
 @message_handler(SUPPORTED_FILES & filters.ChatType.PRIVATE)
 @auth_required
-async def download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Automatically download a supported file sent in an authorized private chat."""
-    logger.info("Download command received")
+async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_download(update.message, context)
 
 
 @callback_query_handler()
 @auth_required
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Keep handling confirmation buttons from messages created before auto-download."""
-    logger.info("Button command received")
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
-    await query.answer()
-    message = update.effective_message.reply_to_message
-    await update.effective_message.edit_reply_markup(reply_markup=None)
-
-    if query.data == "yes":
-        await start_download(message, context)
-    else:
-        logger.info("Download cancelled")
-        await message.reply_text("Download cancelled.")
-
-
-async def start_download(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the existing Yes branch for a document, video, or audio message."""
-    telegram_file, file_name = get_message_file(message)
-    file_name = build_download_name(message, telegram_file, file_name)
-    display_name = escape_markdown(file_name, version=2, entity_type="code")
-    file_id = telegram_file.file_id
-    file_size = telegram_file.file_size or 0
-
+    if query.data == 'yes':
+        await start_download(update.effective_message.reply_to_message, context)
+    # A failed acknowledgement must not prevent already accepted work.
     try:
-        check_file_exists(file_id, file_name)
-    except Exception as e:
-        logger.error(f"Error checking file exists: {e}")
-        await message.reply_text(
-            f"⛔ File already exists\\!\nError:```\n{e}```",
-            parse_mode="MarkdownV2",
-        )
-        return
-
-    logger.info("Downloading file...")
-    download_file = DownloadFile(file_id, file_name, file_size)
-    downloading_files[file_id] = download_file
-    await message.reply_text("⬇️ Downloading file...")
-
-    try:
-        new_file = await get_file(context.bot, download_file)
-    except Exception as e:
-        logger.error(f"Error downloading file: {e}")
-        traceback.print_exc()
-        downloading_files.pop(file_id)
-        await message.reply_text(
-            (
-                f"⛔ Error downloading file\n"
-                f"> 📄 *File name:*   `{display_name}`\n"
-                f"> 💾 *File size:*   `{download_file.file_size_mb}`\n"
-                f"```\n{e}```"
-            ),
-            parse_mode="MarkdownV2",
-        )
-        return
-    else:
-        download_file.download_complete()
-
-    file_path = new_file.file_path
-    current_file_path = resolve_file_path(file_path)
-    move_to_path = os.path.join(DOWNLOAD_TO_DIR, file_name)
-    display_path = escape_markdown(move_to_path, version=2, entity_type="code")
-
-    try:
-        os.makedirs(DOWNLOAD_TO_DIR, exist_ok=True)
-        os.rename(current_file_path, move_to_path)
-    except Exception as rename_error:
-        logger.error(f"Error RENAMING file: {rename_error}")
-        try:
-            await asyncio.to_thread(shutil.move, current_file_path, move_to_path)
-        except Exception as move_error:
-            logger.error(f"Error MOVING file: {move_error}")
-            downloading_files.pop(file_id)
-            await message.reply_text(
-                (
-                    f"⛔ Error moving file\n"
-                    f"> 📂 *File path:*   `{file_path}`\n"
-                    f"> 📂 *Move to path:*   `{display_path}`\n"
-                    f"Rename error:\n```\n{rename_error}```\n"
-                    f"Move error:\n```\n{move_error}```"
-                ),
-                parse_mode="MarkdownV2",
-            )
-            return
-
-    download_file.move_complete()
-    downloading_files.pop(file_id)
-
-    if platform.system() == "Linux":
-        os.chmod(move_to_path, 0o664)
-
-    response_message = (
-        f"✅ File downloaded successfully\\.\n\n"
-        f"> 📄 *File name:*   `{display_name}`\n"
-        f"> 📂 *File path:*   `{file_path}`\n"
-        f"> 💾 *File size:*   `{download_file.file_size_mb}`\n"
-        f"> 🔻 *Retries:*   `{download_file.download_retries}`\n"
-        f"> ⏱ *Download Duration:*   `{download_file.download_duration}`\n"
-        f"> ⏱ *Moving Duration:*   `{download_file.move_duration}`\n"
-        f"> ⏱ *Total Duration:*   `{download_file.total_duration}`"
-    )
-    await message.reply_text(response_message, parse_mode="MarkdownV2")
+        await query.answer()
+        await update.effective_message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        logger.warning('legacy_button_ack_failed')

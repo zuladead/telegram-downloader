@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 from telegram import Message, MessageOriginChannel
 
-from src.cogs.downloader import start_download
+from src.cogs.downloader import run_download, start_download
+from src.task_queue import DownloadQueue
 from src.models import downloading_files
 from src.utils.file_naming import MAX_FILENAME_BYTES, build_download_name
 
@@ -33,6 +34,8 @@ def message(file=None, origin=None, caption="海边日落", date=RECEIVED):
         caption=caption,
         date=date,
         reply_text=AsyncMock(),
+        chat_id=1,
+        message_id=1,
     )
 
 
@@ -175,6 +178,31 @@ class DownloadNamingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         downloading_files.clear()
 
+    async def download_queued(self, msg, directory):
+        import asyncio
+        from unittest.mock import Mock
+        notices = SimpleNamespace(add=Mock())
+        manager = DownloadQueue(
+            str(Path(directory) / 'state' / 'tasks.sqlite3'),
+            lambda task_id, payload: run_download(None, task_id, payload), notices.add,
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={
+            'downloads': manager, 'notifications': notices,
+        }))
+        await manager.start()
+        try:
+            # Notification transport is deliberately unavailable. Admission and
+            # worker completion must never call the old reply_text path.
+            msg.reply_text.side_effect = TimeoutError('notification offline')
+            await start_download(msg, context)
+            await asyncio.wait_for(manager.queue.join(), 2)
+            self.assertGreaterEqual(manager.summary().get('succeeded', 0), 1)
+            self.assertEqual(set(manager.summary()), {'succeeded'})
+            msg.reply_text.assert_not_awaited()
+            return notices
+        finally:
+            await manager.close()
+
     async def test_same_original_names_are_saved_as_separate_files(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = []
@@ -190,16 +218,16 @@ class DownloadNamingTests(unittest.IsolatedAsyncioTestCase):
                         AsyncMock(return_value=SimpleNamespace(file_path=str(source))),
                     ),
                 ):
-                    await start_download(msg, SimpleNamespace(bot=None))
+                    await self.download_queued(msg, directory)
                 target = Path(directory) / build_download_name(
                     msg, msg.video, "视频.mp4"
                 )
                 self.assertEqual(target.read_bytes(), b"video")
                 paths.append(target)
             self.assertNotEqual(paths[0], paths[1])
-            self.assertEqual(len(list(Path(directory).iterdir())), 2)
+            self.assertEqual(len(list(Path(directory).glob('*.mp4'))), 2)
 
-    async def test_backticks_in_caption_are_escaped_in_success_message(self):
+    async def test_backticks_in_caption_are_preserved_in_plain_text_notification(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "temporary"
             source.write_bytes(b"video")
@@ -212,10 +240,10 @@ class DownloadNamingTests(unittest.IsolatedAsyncioTestCase):
                     AsyncMock(return_value=SimpleNamespace(file_path=str(source))),
                 ),
             ):
-                await start_download(msg, SimpleNamespace(bot=None))
-            response = msg.reply_text.call_args.args[0]
-            self.assertIn("a\\`b", response)
-            self.assertIn("successfully", response)
+                notices = await self.download_queued(msg, directory)
+            response = notices.add.call_args.args[1]
+            self.assertIn('a`b', response)
+            self.assertIn('成功', response)
 
 
 if __name__ == "__main__":

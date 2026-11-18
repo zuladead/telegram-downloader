@@ -8,6 +8,7 @@ from telegram.error import NetworkError
 from src.utils.env import env
 
 from ..models import DownloadFile, downloading_files
+from ..safe_logging import safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ async def get_file(bot: Bot, file: DownloadFile) -> File:
     """
     for i in range(MAX_RETRIES):
         # Log attempt
-        logger.info(f"Downloading file, attempt {i + 1}")
+        task_id = getattr(file, 'task_id', 'legacy')
+        logger.info('task=%s state=requesting attempt=%s/%s', task_id, i + 1, MAX_RETRIES)
         file.download_retries = i
 
         # Check if file exists in directory already
@@ -41,11 +43,13 @@ async def get_file(bot: Bot, file: DownloadFile) -> File:
 
         try:
             new_file = await bot.get_file(file.file_id, read_timeout=1800)
-            logger.info("File downloaded successfully")
+            logger.info('task=%s state=downloaded attempt=%s', task_id, i + 1)
             break
         except NetworkError as e:
-            logger.error(f"Server disconnect error: {e}")
-            await asyncio.sleep(INITIAL_RETRY_DELAY * i)
+            logger.warning('task=%s state=retry_wait attempt=%s error=%s',
+                           task_id, i + 1, safe_error(e))
+            if i + 1 < MAX_RETRIES:
+                await asyncio.sleep(min(60, INITIAL_RETRY_DELAY * 2 ** i))
 
     else:
         raise Exception("Max retries reached")
