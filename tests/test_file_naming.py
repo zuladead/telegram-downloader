@@ -11,7 +11,10 @@ from telegram import Message, MessageOriginChannel
 from src.cogs.downloader import run_download, start_download
 from src.task_queue import DownloadQueue
 from src.models import downloading_files
-from src.utils.file_naming import MAX_FILENAME_BYTES, build_download_name
+from src.utils.file_naming import (
+    MAX_FILENAME_BYTES, MAX_SOURCE_DIR_BYTES, build_download_name,
+    build_source_directory, download_relative_path,
+)
 
 RECEIVED = datetime(2026, 11, 2, 0, 0, tzinfo=UTC)
 
@@ -48,7 +51,7 @@ class FilenameTests(unittest.TestCase):
         msg = message(origin=channel())
         self.assertEqual(
             build_download_name(msg, msg.video, "视频.mp4"),
-            "视频_示例频道_2026-11-02_海边日落_AgAD_abc-123.mp4",
+            "海边日落_视频_2026-11-02_AgAD_abc-123.mp4",
         )
 
     def test_forward_date_takes_precedence_and_uses_beijing_date(self):
@@ -60,13 +63,13 @@ class FilenameTests(unittest.TestCase):
         msg = message(caption=None, date=datetime(2026, 11, 1, 17, tzinfo=UTC))
         self.assertEqual(
             build_download_name(msg, msg.video, "视频.mp4"),
-            "视频_来源未知_2026-11-02_无说明_AgAD_abc-123.mp4",
+            "无说明_视频_2026-11-02_AgAD_abc-123.mp4",
         )
 
     def test_hidden_user_source(self):
         origin = SimpleNamespace(sender_user_name="匿名用户", date=RECEIVED)
         msg = message(origin=origin)
-        self.assertIn("_匿名用户_", build_download_name(msg, msg.video, "视频.mp4"))
+        self.assertEqual(build_source_directory(msg), "匿名用户")
 
     def test_chat_and_user_sources(self):
         for origin in (
@@ -77,9 +80,7 @@ class FilenameTests(unittest.TestCase):
         ):
             with self.subTest(origin=origin):
                 msg = message(origin=origin)
-                self.assertNotIn(
-                    "_来源未知_", build_download_name(msg, msg.video, "视频.mp4")
-                )
+                self.assertNotEqual(build_source_directory(msg), "来源未知")
 
     def test_different_files_with_same_original_name_have_different_names(self):
         first, second = message(file=media("unique-1")), message(file=media("unique-2"))
@@ -100,7 +101,7 @@ class FilenameTests(unittest.TestCase):
         msg = message()
         self.assertTrue(
             build_download_name(msg, msg.video, "film.part1.MKV").startswith(
-                "film.part1_"
+                "海边日落_film.part1_"
             )
         )
         self.assertTrue(
@@ -120,12 +121,15 @@ class FilenameTests(unittest.TestCase):
         name = build_download_name(msg, msg.video, "../../视频.mp4")
         self.assertFalse(any(char in name for char in '<>:"/\\|?*\n\t\x00'))
         self.assertEqual(os.path.basename(name), name)
+        folder = build_source_directory(msg)
+        self.assertFalse(any(char in folder for char in '< > : " / \\ | ? *'.replace(" ", "")))
+        self.assertEqual(os.path.basename(folder), folder)
 
     def test_empty_cleaned_values_use_defaults(self):
         msg = message(origin=channel(" \n "), caption="\n\t")
         name = build_download_name(msg, msg.video, "视频.mp4")
-        self.assertIn("_来源未知_", name)
-        self.assertIn("_无说明_", name)
+        self.assertEqual(build_source_directory(msg), "来源未知")
+        self.assertTrue(name.startswith("无说明_"))
 
     def test_long_unicode_name_preserves_full_id_and_extension(self):
         msg = message(
@@ -137,11 +141,16 @@ class FilenameTests(unittest.TestCase):
         self.assertLessEqual(len(name.encode("utf-8")), MAX_FILENAME_BYTES)
         self.assertTrue(name.endswith("_" + msg.video.file_unique_id + ".mp4"))
         self.assertEqual(name.encode("utf-8").decode("utf-8"), name)
+        folder = build_source_directory(msg)
+        self.assertLessEqual(len(folder.encode("utf-8")), MAX_SOURCE_DIR_BYTES)
+        self.assertEqual(folder.encode("utf-8").decode("utf-8"), folder)
 
     def test_caption_is_shortened_before_original_stem(self):
         msg = message(caption="说明" * 200)
         name = build_download_name(msg, msg.video, "完整原文件名.mp4")
-        self.assertTrue(name.startswith("完整原文件名_来源未知_2026-11-02_"))
+        self.assertTrue(name.endswith("_完整原文件名_2026-11-02_AgAD_abc-123.mp4"))
+        self.assertLess(len(name.split("_完整原文件名_")[0]), 400)
+        self.assertLessEqual(len(name.encode("utf-8")), MAX_FILENAME_BYTES)
 
     def test_actual_telegram_message_origin(self):
         msg = Message.de_json(
@@ -170,8 +179,9 @@ class FilenameTests(unittest.TestCase):
         self.assertIsInstance(msg.forward_origin, MessageOriginChannel)
         self.assertEqual(
             build_download_name(msg, msg.video, msg.video.file_name),
-            "视频_真实结构频道_2026-11-02_说明_actual-id.mp4",
+            "说明_视频_2026-11-02_actual-id.mp4",
         )
+        self.assertEqual(build_source_directory(msg), "真实结构频道")
 
 
 class DownloadNamingTests(unittest.IsolatedAsyncioTestCase):
@@ -219,13 +229,55 @@ class DownloadNamingTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ):
                     await self.download_queued(msg, directory)
-                target = Path(directory) / build_download_name(
+                target = Path(directory) / build_source_directory(msg) / build_download_name(
                     msg, msg.video, "视频.mp4"
                 )
                 self.assertEqual(target.read_bytes(), b"video")
                 paths.append(target)
             self.assertNotEqual(paths[0], paths[1])
-            self.assertEqual(len(list(Path(directory).glob('*.mp4'))), 2)
+            self.assertEqual(len(list(Path(directory).glob('示例频道/*.mp4'))), 2)
+
+    async def test_forward_origin_folders_and_unknown_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (origin, folder) in enumerate((
+                (channel("频道甲"), "频道甲"),
+                (SimpleNamespace(sender_user=SimpleNamespace(full_name="联系人乙"),
+                                 date=RECEIVED), "联系人乙"),
+                (None, "来源未知"),
+            )):
+                msg = message(file=media("id-" + str(index)), origin=origin)
+                source = Path(directory) / f"temporary-{index}"
+                source.write_bytes(b"video")
+                with (
+                    patch("src.cogs.downloader.DOWNLOAD_TO_DIR", directory),
+                    patch(
+                        "src.cogs.downloader.get_file",
+                        AsyncMock(return_value=SimpleNamespace(file_path=str(source))),
+                    ),
+                ):
+                    await self.download_queued(msg, directory)
+                target = Path(directory) / folder / build_download_name(
+                    msg, msg.video, "视频.mp4"
+                )
+                self.assertEqual(target.read_bytes(), b"video")
+            self.assertFalse(list(Path(directory).glob("*.mp4")))
+
+    async def test_legacy_queued_payload_still_saves_to_download_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "temporary"
+            source.write_bytes(b"video")
+            payload = {"file_id": "old-id", "file_name": "legacy.mp4", "file_size": 5}
+            self.assertEqual(download_relative_path(payload), "legacy.mp4")
+            with (
+                patch("src.cogs.downloader.DOWNLOAD_TO_DIR", directory),
+                patch(
+                    "src.cogs.downloader.get_file",
+                    AsyncMock(return_value=SimpleNamespace(file_path=str(source))),
+                ),
+            ):
+                target = await run_download(None, "legacy-task", payload)
+            self.assertEqual(Path(target).read_bytes(), b"video")
+            self.assertEqual(Path(target), Path(directory) / "legacy.mp4")
 
     async def test_backticks_in_caption_are_preserved_in_plain_text_notification(self):
         with tempfile.TemporaryDirectory() as directory:

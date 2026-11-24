@@ -63,6 +63,19 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             manager.submit(payload(2))
         self.assertEqual(manager.summary(), {'queued': 1})
 
+    async def test_same_filename_in_different_source_folders_is_not_duplicate(self):
+        manager = self.manager(AsyncMock(), capacity=2)
+        first = payload(1)
+        first["source_dir"] = "频道甲"
+        second = payload(2)
+        second["file_name"] = first["file_name"]
+        second["source_dir"] = "频道乙"
+        one_id, one_created = manager.submit(first)
+        two_id, two_created = manager.submit(second)
+        self.assertTrue(one_created)
+        self.assertTrue(two_created)
+        self.assertNotEqual(one_id, two_id)
+
     async def test_failed_jobs_persist_and_manual_retry_does_not_duplicate(self):
         manager = self.manager(AsyncMock(side_effect=OSError('offline')))
         await manager.start()

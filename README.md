@@ -163,26 +163,31 @@ publication. Keep both existing volume mappings.
 Documents, videos, and audio files are saved as:
 
 ```text
-original-stem_source_YYYY-MM-DD_caption_file_unique_id.extension
+caption_original-stem_YYYY-MM-DD_file_unique_id.extension
 ```
 
 - The original extension and the complete Telegram `file_unique_id` are preserved.
-- Source uses the forwarded channel/chat/user name when available, including
-  hidden-sender display names. Missing sources use `来源未知`.
+- Files are saved in `DOWNLOAD_TO_DIR/<forward_origin name>/` folders, using
+  forwarded channel/chat/user names (including hidden-sender display names).
+  Direct uploads or missing origins go to `来源未知/`. Folder names are cleaned
+  and capped at 200 UTF-8 bytes; identical visible source names share a folder.
 - The date uses the original forward date, or the received message date for
   direct uploads, converted to Beijing time (UTC+8).
 - Caption uses the media message's own caption. Missing captions use `无说明`.
   Separate text messages and captions on other album items are not combined.
 - Invalid filename characters, control characters, and line breaks are cleaned.
-  Names are limited to 240 UTF-8 bytes: caption, original stem, then source are
-  shortened as needed. The full unique ID and extension are never shortened.
+  Filenames are limited to 240 UTF-8 bytes: caption is shortened first, then
+  the original stem. The full date, unique ID and extension are never shortened.
 - Files without an original name keep the existing generated-name fallback.
 
 Different Telegram files with identical original names can now be saved
-separately. Existing files are not renamed. The task database does not add
-persistent unique-ID deduplication or video-content matching. Forwarding the
-same file with different source/caption/date metadata can still create another
-filename until persistent deduplication is added.
+separately. Existing files are not moved or renamed. New files are placed in
+folders based on `forward_origin`. Pending tasks created by older versions
+without a source folder retain their original root-directory destination.
+The task database does not add persistent unique-ID deduplication or
+video-content matching. Active duplicate file IDs are still coalesced.
+Forwarding the same file with different source/caption/date metadata can still
+create another stored copy until persistent deduplication is added.
 
 ### Local verification
 

@@ -12,7 +12,7 @@ from ..middlewares.auth import auth_required
 from ..middlewares.handlers import callback_query_handler, command_handler, message_handler
 from ..models import DownloadFile
 from ..utils import env, get_file
-from ..utils.file_naming import build_download_name
+from ..utils.file_naming import build_download_name, build_source_directory, download_relative_path
 
 logger = logging.getLogger(__name__)
 BOT_API_DIR = env.BOT_API_DIR
@@ -55,14 +55,15 @@ def _publish(source, target, expected_size, task_id):
 
 
 async def run_download(bot, task_id, payload):
-    target = Path(DOWNLOAD_TO_DIR) / payload['file_name']
+    relative_path = download_relative_path(payload)
+    target = Path(DOWNLOAD_TO_DIR) / relative_path
     if target.exists():
         # A process may have stopped after publication but before saving success.
         if payload['file_size'] and target.stat().st_size == payload['file_size']:
             logger.info('task=%s state=verified_existing result=%s', task_id, target)
             return str(target)
         raise FileExistsError('Destination exists with unknown or mismatched size')
-    file = DownloadFile(payload['file_id'], payload['file_name'], payload['file_size'])
+    file = DownloadFile(payload['file_id'], relative_path, payload['file_size'])
     file.task_id = task_id
     # Bound all getFile attempts together; local Bot API may still transfer in
     # the background after the HTTP request has ended.
@@ -97,6 +98,7 @@ async def start_download(message, context):
         'file_id': media.file_id,
         'file_unique_id': media.file_unique_id,
         'file_name': build_download_name(message, media, name),
+        'source_dir': build_source_directory(message),
         'file_size': media.file_size or 0,
         'chat_id': message.chat_id,
         'message_id': message.message_id,
@@ -110,7 +112,7 @@ async def start_download(message, context):
         notices.add(message.chat_id, f'未入队 message={message.message_id}: {exc}')
         return
     verb = '已排队' if created else '已在队列中'
-    notices.add(message.chat_id, f'{verb} #{task_id}: {payload["file_name"]}')
+    notices.add(message.chat_id, f'{verb} #{task_id}: {download_relative_path(payload)}')
 
 
 @command_handler('status')
@@ -125,7 +127,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     for task_id, state, encoded, error, runs in manager.recent(state='failed', limit=5):
-        name = json.loads(encoded)['file_name'][:40]
+        name = download_relative_path(json.loads(encoded))[:40]
         text += f'\n#{task_id} {name}\n{state} 执行{runs}次 {error[:60]}'
     text += '\n/retry_failed 重试失败任务；/retry 任务编号 重试单个任务'
     context.application.bot_data['notifications'].add(update.effective_chat.id, text)

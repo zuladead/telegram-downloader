@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from .safe_logging import safe_error
+from .utils.file_naming import download_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ class DownloadQueue:
         ):
             existing = json.loads(encoded)
             if (existing['file_id'] == payload['file_id']
-                    or existing['file_name'] == payload['file_name']):
+                    or download_relative_path(existing) == download_relative_path(payload)):
                 return task_id, False
         if self._outstanding() >= self.capacity:
             raise ValueError("Queue is full; please resend this file later")
@@ -95,7 +96,8 @@ class DownloadQueue:
                 "SELECT payload FROM tasks WHERE state IN ('queued','running')"
             ).fetchall()
             if any(json.loads(p[0])['file_id'] == payload['file_id']
-                   or json.loads(p[0])['file_name'] == payload['file_name'] for p in active):
+                   or download_relative_path(json.loads(p[0])) == download_relative_path(payload)
+                   for p in active):
                 continue
             self._save_state(job_id, 'queued')
             self.queue.put_nowait(job_id)
@@ -141,7 +143,7 @@ class DownloadQueue:
                 self._save_state(task_id, 'succeeded', result=str(result))
                 logger.info("task=%s state=succeeded elapsed=%.2f result=%s",
                             task_id, time.monotonic() - started, result)
-                self._notify(payload['chat_id'], f"成功 #{task_id}: {payload['file_name']}")
+                self._notify(payload['chat_id'], f"成功 #{task_id}: {download_relative_path(payload)}")
             except asyncio.CancelledError:
                 self._save_state(task_id, 'queued', error='Interrupted; recovered on restart')
                 logger.info("task=%s state=queued reason=shutdown", task_id)
